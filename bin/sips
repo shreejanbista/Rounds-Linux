@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Minimal stand-in for macOS `sips`, backed by libvips. Written for Rounds
+# (github:krispuckett/rounds), which calls exactly these two forms:
+#
+#   sips -Z <max> -s format jpeg -s formatOptions <quality> <src> --out <out>
+#       Fit the image inside <max> x <max> (longest side = <max>, like sips -Z),
+#       never enlarging, and save as JPEG at <quality>.
+#   sips -g pixelWidth -g pixelHeight <file>
+#       Print the size in sips's own format.
+#
+# Anything else exits with an error, so the caller falls back to its own path.
+# Remove this file to undo.
+set -euo pipefail
+
+die() { echo "sips (libvips stand-in): $*" >&2; exit 1; }
+command -v vips >/dev/null || die "libvips is not installed"
+
+# Hide libvips's notice about its optional OpenSlide plugin (medical slide images, not needed).
+# Real errors still come through.
+exec 2> >(grep -v --line-buffered 'vips-openslide\|^$' >&2)
+
+max="" format="" quality="85" out="" src="" getw=0 geth=0
+while (($#)); do
+  case "$1" in
+    -Z|--resampleHeightWidthMax) max="${2:?}"; shift 2 ;;
+    -s|--setProperty)
+      case "${2:?}" in
+        format) format="${3:?}" ;;
+        formatOptions) quality="${3:?}" ;;
+        *) die "unsupported property: $2" ;;
+      esac
+      shift 3 ;;
+    -g|--getProperty)
+      case "${2:?}" in
+        pixelWidth) getw=1 ;;
+        pixelHeight) geth=1 ;;
+        *) die "unsupported property: $2" ;;
+      esac
+      shift 2 ;;
+    -o|--out) out="${2:?}"; shift 2 ;;
+    -*) die "unsupported option: $1" ;;
+    *) [[ -z "$src" ]] || die "only one input file is supported"; src="$1"; shift ;;
+  esac
+done
+
+[[ -n "$src" ]] || die "no input file"
+[[ -f "$src" ]] || die "no such file: $src"
+
+if ((getw || geth)); then
+  echo "$src"
+  ((getw)) && echo "  pixelWidth: $(vipsheader -f width "$src")"
+  ((geth)) && echo "  pixelHeight: $(vipsheader -f height "$src")"
+  exit 0
+fi
+
+[[ -n "$max" && -n "$out" ]] || die "need -Z <size> and --out <file>"
+[[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || die "bad size: $max"
+[[ "$quality" =~ ^[0-9]+$ ]] || die "bad quality: $quality"
+case "${format:-jpeg}" in jpeg|jpg) ;; *) die "only jpeg output is supported" ;; esac
+
+# Write to a temp file beside the target, then move it into place, so a half-written
+# file is never picked up as finished.
+dir="$(dirname -- "$out")"
+tmp="$(mktemp "$dir/.sips-XXXXXX.jpg")"
+trap 'rm -f -- "$tmp"' EXIT
+# keep=none drops metadata; background=255 puts transparent areas on white (JPEG has no transparency).
+vips thumbnail "$src" "$tmp[Q=$quality,keep=none,background=255]" "$max" --height "$max" --size down
+mv -f -- "$tmp" "$out"
+trap - EXIT

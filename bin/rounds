@@ -1,0 +1,210 @@
+#!/usr/bin/env node
+// rounds: a launcher for Rounds (github.com/krispuckett/rounds, by Kris Puckett), from Rounds-Linux.
+//
+//   rounds [anything]          runs the copy of Rounds that `init` made in ~/.rounds/app, offline,
+//                              with every word passed through to Rounds unchanged
+//                              (init, update, uninstall, index, --demo ...)
+//   rounds upgrade             checks GitHub for a newer Rounds, shows what changed, asks to install it
+//   rounds upgrade --check     only shows what changed; installs nothing
+//   rounds upgrade --yes       installs without asking
+//
+// Starting the canvas never waits on the network. At most once a day it checks for a newer Rounds in
+// the background, and the next start prints one line if there is one. Nothing changes until you run
+// `rounds upgrade` and say yes.
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import crypto from "node:crypto";
+import readline from "node:readline/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const REPO = "krispuckett/rounds";
+const API = (process.env.ROUNDS_LINUX_API || "https://api.github.com").replace(/\/$/, "");
+const DATA = process.env.ROUNDS_HOME || path.join(os.homedir(), ".rounds");
+const APP = path.join(DATA, "app");
+const STATE = path.join(DATA, "rounds-linux.json");
+const NPM_CACHE = process.env.ROUNDS_LINUX_NPX_CACHE || path.join(os.homedir(), ".npm", "_npx");
+const NPX = process.env.ROUNDS_LINUX_NPX || "npx";
+const DAY = 24 * 3600e3;
+const SELF = fileURLToPath(import.meta.url);
+
+const say = (s = "") => process.stdout.write(s + "\n");
+const short = (sha) => (sha || "").slice(0, 7);
+if (Number(process.versions.node.split(".")[0]) < 20) { say(`Rounds needs Node 20 or newer; this is ${process.version}.`); process.exit(1); }
+
+// ---------- what we remember (in ~/.rounds/rounds-linux.json, beside Rounds' own files) ----------
+function readState() { try { return JSON.parse(fs.readFileSync(STATE, "utf8")); } catch { return {}; } }
+function writeState(s) {
+  fs.mkdirSync(DATA, { recursive: true });
+  const tmp = `${STATE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2) + "\n");
+  fs.renameSync(tmp, STATE);
+}
+const appVersion = (dir = APP) => { try { return JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).version; } catch { return null; } };
+
+// The same fingerprint Rounds uses to tell copies apart: the files it copies into ~/.rounds/app.
+function fingerprint(dir) {
+  const h = crypto.createHash("sha1");
+  const walk = (rel) => {
+    const f = path.join(dir, rel);
+    if (!fs.existsSync(f)) return;
+    if (fs.statSync(f).isDirectory()) { for (const n of fs.readdirSync(f).sort()) walk(path.join(rel, n)); return; }
+    h.update(rel); h.update(fs.readFileSync(f));
+  };
+  ["bin", "server", "hooks", "skill", "dist", "package.json"].forEach(walk);
+  return h.digest("hex");
+}
+
+// Which commit of Rounds is in ~/.rounds/app? We record it on every upgrade. If it was put there some
+// other way (init, or a plain `npx github:krispuckett/rounds`), we find the npx download it was copied
+// from: same fingerprint, and npm's lockfile names the exact commit.
+function installed(state) {
+  if (!fs.existsSync(path.join(APP, "bin", "rounds.mjs"))) return null;
+  const fp = fingerprint(APP);
+  if (state.installed?.fingerprint === fp) return state.installed;
+  let found = null;
+  try {
+    for (const d of fs.readdirSync(NPM_CACHE)) {
+      const pkg = path.join(NPM_CACHE, d, "node_modules", "rounds-app");
+      let lock;
+      try { lock = JSON.parse(fs.readFileSync(path.join(NPM_CACHE, d, "package-lock.json"), "utf8")); } catch { continue; }
+      const m = /#([0-9a-f]{40})$/.exec(lock.packages?.["node_modules/rounds-app"]?.resolved || "");
+      if (m && fs.existsSync(pkg) && fingerprint(pkg) === fp) { found = m[1]; break; }
+    }
+  } catch {}
+  return { sha: found, version: appVersion(), fingerprint: fp };
+}
+
+// ---------- GitHub ----------
+async function gh(p, ms) {
+  const headers = { Accept: "application/vnd.github+json", "User-Agent": "rounds-linux" };
+  if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  const r = await fetch(`${API}${p}`, { headers, signal: AbortSignal.timeout(ms) });
+  if (r.status === 403 || r.status === 429) throw new Error("GitHub is limiting requests right now; try again in an hour (or set GITHUB_TOKEN)");
+  if (!r.ok) throw new Error(`GitHub answered ${r.status} for ${p}`);
+  return r.json();
+}
+async function latest(ms) {
+  const c = await gh(`/repos/${REPO}/commits/HEAD`, ms);
+  const f = await gh(`/repos/${REPO}/contents/package.json?ref=${c.sha}`, ms);
+  const version = JSON.parse(Buffer.from(f.content, "base64").toString("utf8")).version;
+  return { sha: c.sha, version, date: c.commit?.committer?.date || null, checkedAt: Date.now() };
+}
+
+// ---------- the background check, at most once a day ----------
+async function backgroundCheck() {
+  const state = readState();
+  try {
+    state.installed = installed(state) || state.installed;
+    state.latest = await latest(8000);
+  } catch { state.lastTry = Date.now(); }
+  writeState(state);
+}
+function maybeCheckLater(state) {
+  if (process.env.ROUNDS_LINUX_NO_CHECK) return;
+  const last = Math.max(state.latest?.checkedAt || 0, state.lastTry || 0);
+  if (Date.now() - last < DAY) return;
+  spawn(process.execPath, [SELF, "__check"], { detached: true, stdio: "ignore" }).unref();
+}
+function notice(state) {
+  const have = state.installed, next = state.latest;
+  if (!have?.sha || !next?.sha || have.sha === next.sha) return;
+  if (have.fingerprint && fs.existsSync(APP) && have.version !== appVersion()) return; // the copy changed since; the next check sorts it out
+  const v = next.version && next.version !== have.version ? `Rounds ${next.version} is out` : "A newer Rounds is out";
+  say(`${v}: run \`rounds upgrade\` to see what's new.\n`);
+}
+
+// ---------- rounds upgrade ----------
+async function upgrade(args) {
+  const checkOnly = args.includes("--check");
+  const yes = args.includes("--yes") || args.includes("-y");
+  const state = readState();
+  const have = installed(state);
+  if (!have) {
+    say(`Rounds isn't set up here yet (nothing in ${APP}). Set it up once with:`);
+    say(`  npx ${allowGit().join(" ")} github:${REPO} init`.replace(/\s+/g, " "));
+    process.exit(1);
+  }
+  say(`You have Rounds ${have.version || "(unknown version)"}${have.sha ? ` (${short(have.sha)})` : ""}. Checking GitHub…`);
+  let next;
+  try { next = await latest(10000); } catch (e) { say(`Couldn't check: ${e.message}.`); process.exit(1); }
+  state.installed = have; state.latest = next; delete state.lastTry;
+  writeState(state);
+
+  if (have.sha === next.sha) { say(`Rounds is up to date.`); return; }
+
+  say();
+  say(`Rounds ${next.version}${next.version === have.version ? " (same version number, newer changes)" : ""} is out, from ${short(next.sha)}${next.date ? ` on ${next.date.slice(0, 10)}` : ""}.`);
+  if (have.sha) {
+    try {
+      const cmp = await gh(`/repos/${REPO}/compare/${have.sha}...${next.sha}`, 10000);
+      if (cmp.status === "ahead" || cmp.status === "diverged") {
+        const list = [...(cmp.commits || [])].reverse(); // newest first
+        say(`What's changed since your build (${cmp.ahead_by} change${cmp.ahead_by === 1 ? "" : "s"}, newest first), in Kris's words:`);
+        say();
+        for (const c of list.slice(0, 40)) say(`  ${(c.commit?.committer?.date || "").slice(0, 10)}  ${(c.commit?.message || "").split("\n")[0]}`);
+        if (cmp.ahead_by > 40) say(`  …and ${cmp.ahead_by - 40} more`);
+        say();
+        say(`Every line of code that changed: https://github.com/${REPO}/compare/${short(have.sha)}...${short(next.sha)}`);
+      } else if (cmp.status === "behind") {
+        say(`Your build is newer than what's on GitHub's main branch, so there's nothing to upgrade to.`);
+        return;
+      }
+    } catch (e) { say(`(Couldn't list the changes: ${e.message}.)`); }
+  } else {
+    say(`Couldn't tell which exact build you have, so here are Kris's latest changes instead:`);
+    say(`  https://github.com/${REPO}/commits`);
+  }
+  say();
+  if (checkOnly) { say(`Nothing was changed. To install it: rounds upgrade`); return; }
+
+  let go = yes;
+  if (!go) {
+    if (!process.stdin.isTTY) { say(`Run it again in a terminal to answer, or add --yes.`); process.exit(1); }
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    go = /^y/i.test((await rl.question(`Install Rounds ${next.version} now? Your canvas and notes stay as they are. [y/N] `)).trim());
+    rl.close();
+  }
+  if (!go) { say(`Kept Rounds ${have.version}. Nothing was changed.`); return; }
+
+  // Rounds' own `update`, run from the new version, swaps ~/.rounds/app for it (whole, so a hook running
+  // meanwhile never sees half a copy) and refreshes the skill. Run from $HOME so no repo is involved.
+  say(`Installing Rounds ${next.version}…`);
+  const r = spawnSync(NPX, ["--yes", ...allowGit(), `github:${REPO}#${next.sha}`, "update"], { cwd: os.homedir(), stdio: "inherit" });
+  if (r.status !== 0) { say(`The install didn't finish (npx exited with ${r.status ?? r.signal}). Your current Rounds is untouched.`); process.exit(1); }
+  const now = { sha: next.sha, version: appVersion(), fingerprint: fingerprint(APP) };
+  writeState({ ...readState(), installed: now, latest: next });
+  say();
+  say(`Done: Rounds ${now.version} (${short(now.sha)}).`);
+  say(`If the canvas is open, stop it and run \`rounds\` again. Claude sessions you start from now on use the new version.`);
+}
+
+// npm 12 refuses packages straight from GitHub unless allowed; `root` allows Rounds only, not its dependencies.
+function allowGit() {
+  if (process.env.ROUNDS_LINUX_NPX) return ["--allow-git=root"];
+  const v = spawnSync("npm", ["--version"], { encoding: "utf8" });
+  return Number((v.stdout || "0").split(".")[0]) >= 12 ? ["--allow-git=root"] : [];
+}
+
+// ---------- start ----------
+const argv = process.argv.slice(2);
+const cmd = argv.find((a) => !a.startsWith("-"));
+
+if (cmd === "__check") { await backgroundCheck(); process.exit(0); }
+if (cmd === "upgrade") { await upgrade(argv.filter((a) => a !== "upgrade")); process.exit(0); }
+
+const entry = path.join(APP, "bin", "rounds.mjs");
+if (!fs.existsSync(entry)) {
+  say(`Rounds isn't set up here yet (nothing in ${APP}). Set it up once with:`);
+  say(`  cd ~ && npx ${allowGit().join(" ")} github:${REPO} init`.replace(/\s+/g, " "));
+  process.exit(1);
+}
+if (!cmd || cmd === "start") {
+  const state = readState();
+  notice(state);
+  maybeCheckLater(state);
+}
+const child = spawn(process.execPath, [entry, ...argv], { stdio: "inherit" });
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => child.kill(sig));
+child.on("exit", (code, signal) => process.exit(code ?? (signal ? 128 + (os.constants.signals[signal] || 0) : 1)));
